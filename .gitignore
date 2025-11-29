@@ -1,0 +1,109 @@
+# .NET Build Artifacts
+bin/
+obj/
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+
+# Visual Studio / VS Code
+.vs/
+.vscode/settings.json
+.vscode/.ropeproject
+*.swp
+*.swo
+*~
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# SQLite Databases (Runtime data)
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+activities*.db
+
+# Logs
+*.log
+build.log
+msbuild.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime Data & Cache
+data/
+cache/
+temp/
+tmp/
+*.tmp
+
+# NuGet
+*.nupkg
+*.snupkg
+**/packages/*
+!**/packages/build/
+.nuget/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Test Results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+*.trx
+*.coverage
+*.coveragexml
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Sensitive Configuration (Optional - uncomment if needed)
+# appsettings.Development.json
+# appsettings.Production.json
+
+# User-specific runtime data
+AppData/
+LocalAppData/
+
+# Rider
+.idea/
+*.sln.iml
+
+# JetBrains Rider
+.idea/
+*.sln.iml
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+# Node (if any frontend)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Agent-specific runtime files
+PerformanceAgent/
+activities_v2.db*
+system-info.json
+installed-apps.json
