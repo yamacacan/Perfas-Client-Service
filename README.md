@@ -1,287 +1,138 @@
-# 🖥️ Performance Agent - Windows Activity Monitoring Service
+# Performance Agent
 
-**Windows kullanıcı aktivitelerini ve tarayıcı geçmişini gerçek zamanlı izleyen .NET 8.0 background servisi.**
+A .NET 8 background agent for Windows that records user activity (active windows, browser history, hardware and installed-app inventory) and forwards it, encrypted, to a remote ingest API.
 
----
+> **Privacy notice:** the agent collects window titles and browsing history. Only deploy it where the people being monitored have been informed and have consented, as required by your local law and policy.
 
-## 📋 Özellikler
+## Features
 
-### ✅ Aktivite İzleme
-- **Window Activity Tracking** - Aktif pencere değişikliklerini kaydet
-- **Browser History Monitoring** - Chrome, Edge, Firefox, Opera, Brave URL'lerini gerçek zamanlı yakala
-- **System State Events** - Sistem kilidi, ekran koruyucu, uyku modu olayları
+- **Window activity** – tracks the active window and how long each one stays in focus.
+- **Browser history** – near real-time capture from Chrome, Edge, Firefox, Opera and Brave (all profiles).
+- **System state events** – lock, unlock, screensaver, sleep.
+- **Inventory** – hardware (model, serial, disk, RAM) and installed apps (Win32 and UWP), refreshed periodically.
+- **Offline-safe storage** – everything is written to local JSONL files first and synced later.
+- **Encrypted sync** – batches are encrypted (AES-256-CBC) and sent over HTTPS; local files are removed after a successful upload.
 
-### ✅ Sistem Bilgileri
-- Donanım bilgileri (CPU, RAM, Disk)
-- İşletim sistemi ve kullanıcı bilgileri
-- Yüklü uygulamalar (UWP ve Win32)
+## Requirements
 
-### ✅ Veri Depolama
-- **Dual Storage** - JSON (JSONL) + SQLite
-- **WAL Mode** - Yüksek performanslı veritabanı yazma
-- **Otomatik Path Resolution** - Kullanıcıdan bağımsız çalışma
+| | |
+|---|---|
+| OS | Windows 10 (1809+) / Windows 11 |
+| Runtime | .NET 8 (not needed for a self-contained build) |
+| SDK (to build) | .NET 8 SDK |
 
----
+## Run modes
 
-## 🔧 Sistem Gereksinimleri
+The executable has two modes:
 
-| Gereksinim | Minimum | Önerilen |
-|------------|---------|----------|
-| **İşletim Sistemi** | Windows 10 (1809+) | Windows 10/11 |
-| **.NET Runtime** | .NET 8.0 | .NET 8.0 |
-| **Disk Alanı** | 100 MB | 500 MB |
-| **RAM** | 256 MB | 512 MB |
+| Mode | Command | Responsibility |
+|------|---------|----------------|
+| Agent (default) | `PerformanceAgent.exe` or `--agent` | Runs in the user session. Tracks windows, browser history, hardware and app inventory and writes them to local files. Never reads API secrets. |
+| Service | `PerformanceAgent.exe --service` | Runs as a Windows service (`PerformanceAgentService`). Reads local files and syncs them to the API. Holds the API secrets. |
 
----
+Sync only runs in service mode, so the API token and encryption key do not need to be readable by normal users.
 
-## 📦 Kurulum
+## Build and run
 
-### 1️⃣ .NET 8.0 Runtime Yükle
-
-**Yüklü mü kontrol et:**
 ```powershell
-dotnet --version
+dotnet build
+dotnet run                 # agent mode
+dotnet run -- --service    # service mode
 ```
 
-**Yükle (Windows):**
+Self-contained single-file publish:
+
 ```powershell
-winget install Microsoft.DotNet.Runtime.8
+dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
 ```
 
-**Veya Manuel:**
-https://dotnet.microsoft.com/download/dotnet/8.0
+## Configuration
 
----
-
-### 2️⃣ Projeyi İndir
-
-```bash
-git clone <repository-url>
-cd WorkerService1
-```
-
----
-
-### 3️⃣ Ayarları Yapılandır (Opsiyonel)
-
-`appsettings.json` dosyasını düzenle:
+Non-secret settings live in `appsettings.json`:
 
 ```json
 {
   "PerformanceAgent": {
-    "PollIntervalMs": 1000,
-    "DataDirectory": "",  // Boş bırak = Otomatik (%LOCALAPPDATA%\PerformanceAgent)
-    "EnableConsoleOutput": true
+    "PollIntervalMs": 2000,
+    "AppsRefreshIntervalHours": 24,
+    "DataDirectory": "",
+    "EnableConsoleOutput": false
+  },
+  "DataSync": {
+    "Enabled": true,
+    "SyncIntervalMinutes": 1,
+    "BatchSize": 100,
+    "DeleteAfterSync": true
   }
 }
 ```
 
-**Varsayılan veri dizini:**
-```
-C:\Users\<USERNAME>\AppData\Local\PerformanceAgent\
-```
+`DataDirectory` defaults to `C:\ProgramData\PerformanceAgent` so the agent and the service share the same data.
 
----
+### Secrets (`ApiUrl`, `ApiToken`, `AesKey`)
 
-### 4️⃣ Çalıştır
+Secrets are never stored in the repository. They are read in this order:
 
-#### Geliştirme Modu:
-```powershell
-dotnet run
-```
+1. Registry: `HKLM\SOFTWARE\Perfas\PerformanceAgent`
+2. Environment variables: `PERFAS_APIURL`, `PERFAS_APITOKEN`, `PERFAS_AESKEY`
+3. `appsettings.json` (`DataSync` section; leave empty in source control)
 
-#### Production Build:
-```powershell
-dotnet publish -c Release -r win-x64 --self-contained false
-cd bin\Release\net8.0-windows10.0.19041.0\win-x64\publish
-.\WorkerService1.exe
-```
+Rules:
 
----
+- `ApiUrl` must be HTTPS (loopback addresses are allowed for development).
+- `AesKey` must be exactly 32 bytes when UTF-8 encoded.
+- If any value is missing or invalid, sync is disabled and the app keeps running.
 
-## 📂 Veri Yapısı
+Restrict the registry key to SYSTEM and Administrators so normal users cannot read the token.
+
+## Data layout
 
 ```
-%LOCALAPPDATA%\PerformanceAgent\
-├── data\
-│   ├── activities\
-│   │   ├── 2025-10-20.jsonl      # Günlük activity logları (JSON Lines)
-│   │   └── ...
-│   └── system\
-│       ├── machine-info.json     # Sistem bilgileri
-│       ├── user-info.json        # Kullanıcı bilgileri
-│       └── installed-apps.json   # Yüklü uygulamalar
-├── logs\
-│   └── system-logs-*.json        # Sistem logları
-└── activities.db                 # SQLite veritabanı
-    ├── activities.db-wal         # Write-Ahead Log
-    └── activities.db-shm         # Shared Memory Index
+C:\ProgramData\PerformanceAgent\
+└── data\
+    ├── activities\   activities_<user>_<date>.jsonl
+    ├── browser\      browser_<user>_<date>.jsonl
+    └── system\       hardware_<date>.jsonl, apps_<timestamp>.jsonl
 ```
 
----
+Each line is one JSON record. After a batch is uploaded, the records that were sent are removed; lines appended during the upload are kept.
 
-## 📊 Veri Formatları
+## Architecture
 
-### Activity Log (JSONL)
-```json
-{"evt":"activity","activity_type":"window","start":"2025-10-20T10:30:00Z","end":"2025-10-20T10:35:00Z","duration_ms":300000,"process":"chrome","title":"GitHub - Google Chrome","username":"user","domain":"MACHINE"}
-{"evt":"activity","activity_type":"browser","start":"2025-10-20T10:31:15Z","end":"2025-10-20T10:31:15Z","duration_ms":0,"process":"Chrome","title":"GitHub Homepage","username":"user","domain":"MACHINE","url":"https://github.com","browser":"Chrome"}
-```
+| Area | Types |
+|------|-------|
+| Composition | `Program.cs` (DI wiring) |
+| Scheduling | `Worker` + `IPeriodicTask` (`HardwareInventoryTask`, `AppInventoryTask`) |
+| Collection | `ActivityTrackingService`, `BrowserHistoryService`, `BrowserHistoryReader`, `SystemInfoService`, `HardwareValueSanitizer`, `ApplicationCollectionService`, `SystemStateService` |
+| Storage | `JsonlFileStore<T>`, `JsonlStorageService`, `IActivityStore` / `IBrowserStore` / `IInstalledAppStore` / `IHardwareStore` |
+| Sync | `DataSyncService`, `DataSyncOptions`, `SyncDtoMapper`, `IIngestClient` (`HttpIngestClient`, `DisabledIngestClient`), `IEncryptionService` (`AesEncryptionService`) |
 
-### SQLite Schema
-```sql
-CREATE TABLE ActivityLogs (
-    Id INTEGER PRIMARY KEY AUTOINCREMENT,
-    Evt TEXT NOT NULL DEFAULT 'activity',
-    ActivityType TEXT NOT NULL,  -- 'window' or 'browser'
-    ProcessName TEXT NOT NULL,
-    Title TEXT,
-    StartTimeUtc TEXT NOT NULL,
-    EndTimeUtc TEXT NOT NULL,
-    DurationMs INTEGER NOT NULL,
-    Username TEXT NOT NULL,
-    Domain TEXT NOT NULL,
-    Url TEXT NULL,               -- Sadece browser aktiviteleri için
-    Browser TEXT NULL,            -- Sadece browser aktiviteleri için
-    CreatedAtUtc TEXT NOT NULL
-);
-```
-
----
-
-## 🔧 Sorun Giderme
-
-### ❌ ".NET 8.0 not found"
-**Çözüm:** .NET 8.0 Runtime yükle
-```powershell
-winget install Microsoft.DotNet.Runtime.8
-```
-
-### ❌ "Access denied" / Yazma izni hatası
-**Çözüm 1:** Uygulamayı yönetici olarak çalıştır
-```powershell
-# PowerShell Admin
-.\WorkerService1.exe
-```
-
-**Çözüm 2:** Veri dizinini değiştir
-```json
-{
-  "DataDirectory": "C:\\ProgramData\\PerformanceAgent"
-}
-```
-
-### ❌ Browser history yakalanmıyor
-**Olası Sebepler:**
-1. **Browser yüklü değil** → Normal, sadece yüklü browser'lar izlenir
-2. **Farklı profile kullanılıyor** → Uygulama otomatik profil taraması yapar
-3. **Portable browser** → Standart path'lerde değil, desteklenmez
-
-**Kontrol:**
-```powershell
-# Chrome history var mı?
-Test-Path "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\History"
-```
-
-### ❌ Antivirus uygulamayı engelliyor
-**Çözüm:** Exception ekle
-- Windows Defender → "Virus & threat protection" → "Exclusions"
-- Klasör ekle: `%LOCALAPPDATA%\PerformanceAgent`
-
----
-
-## 🏗️ Geliştirme
-
-### Build
-```powershell
-dotnet build
-```
-
-### Test
-```powershell
-dotnet run
-```
-
-### Debug Logging Aç
-`appsettings.json`:
-```json
-{
-  "Logging": {
-    "LogLevel": {
-      "WorkerService1": "Debug",
-      "WorkerService1.Services.BrowserHistoryService": "Debug"
-    }
-  }
-}
-```
-
----
-
-## 📄 Lisans
-
-Bu proje özel/ticari kullanım için geliştirilmiştir.
-
----
-
-## 🤝 Destek
-
-Sorunlar için:
-1. `logs/` klasöründeki hata loglarını kontrol et
-2. GitHub Issues sayfasından yeni issue aç
-3. System validation hatalarını paylaş:
-   ```
-   .\WorkerService1.exe > startup-log.txt 2>&1
-   ```
-
----
-
-## 🔒 Güvenlik & Gizlilik
-
-- ✅ Tüm veriler **yerel** olarak saklanır
-- ✅ Şifreleme yok (gerekirse eklenebilir)
-- ✅ Ağ bağlantısı yok (data upload servisi eklenebilir)
-- ⚠️ Hassas veriler içerebilir (URL'ler, window title'ları)
-
-**Öneriler:**
-- Paylaşılan bilgisayarlarda dikkatli kullan
-- Backup alırken dosyaları şifrele
-- Production'da veri retention policy uygula
-
----
-
-## 📈 Performans
-
-| Metrik | Değer |
-|--------|-------|
-| **CPU Kullanımı** | ~0.5-2% (idle) |
-| **RAM Kullanımı** | ~50-100 MB |
-| **Disk Yazma** | ~10-50 KB/dakika |
-| **Event Response** | <100ms |
-| **Browser Detection** | <2 saniye (debounce) |
-
----
-
-## 🎯 Roadmap
-
-- [ ] **Data Upload Service** - HTTP API ile veri gönderme
-- [ ] **Encryption** - Hassas verileri şifrele
-- [ ] **Web Dashboard** - Verileri görselleştir
-- [ ] **Windows Service** - Arka planda sürekli çalış
-- [ ] **Multi-platform** - Linux/Mac desteği (sınırlı)
-
----
-
-**🚀 Hazır! Şimdi kullanmaya başlayabilirsin.**
+## Tests
 
 ```powershell
-dotnet run
+dotnet test Tests
 ```
 
+The tests cover encryption key validation, JSONL storage safety (no data loss, no deletes outside the data directory) and parsing of browser history and hardware values.
 
----
+## Security notes
 
-## Gizli Bilgiler (ApiUrl / ApiToken / AesKey)
+- No secrets in source control. If a token or key was ever committed, rotate it on the server.
+- Responses from the API are not logged.
+- HTTP redirects are disabled for the ingest client.
+- The data directory grants full control to SYSTEM and Administrators and Modify to Users only.
+- The encryption format (AES-CBC, `IV + ciphertext`, Base64) is fixed by the server contract and does not include an integrity check. Rely on HTTPS for transport integrity.
 
-Bu değerler repoda tutulmaz. Okunma sırası: HKLM\SOFTWARE\Perfas\PerformanceAgent (MSI yazar) → ortam değişkenleri `PERFAS_APIURL`, `PERFAS_APITOKEN`, `PERFAS_AESKEY` → appsettings.json. ApiUrl HTTPS olmalı, AesKey UTF-8 olarak tam 32 bayt olmalıdır; aksi halde senkronizasyon devre dışı kalır.
+## Troubleshooting
 
-Testler: `dotnet test Tests`
+**Sync does nothing.** Check the log for "DataSync disabled": the URL, token or key is missing or invalid, or the service is not running.
+
+**Access denied on the data directory.** Run once as administrator, or set `DataDirectory` to a path writable by the account that runs the agent.
+
+**No browser history captured.** Only installed browsers with standard profile paths are monitored. Portable browsers are not supported.
+
+**Antivirus blocks the agent.** Add an exclusion for the install folder and `C:\ProgramData\PerformanceAgent`.
+
+## License
+
+Proprietary. Intended for private or commercial use.
