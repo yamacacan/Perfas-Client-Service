@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
@@ -50,15 +52,22 @@ namespace WorkerService1.Services
         {
             try
             {
+                string dataDir;
+                
                 // Konfigüre edilmiş yol sağlanmışsa ve geçerliyse kullan
                 if (!string.IsNullOrWhiteSpace(configuredPath) && IsValidPath(configuredPath))
                 {
-                    return Path.GetFullPath(configuredPath);
+                    dataDir = Path.GetFullPath(configuredPath);
                 }
-
-                // Ortam tabanlı yola geri dön
-                var basePath = GetEnvironmentBasedPath();
-                var dataDir = Path.Combine(basePath, "PerformanceAgent");
+                else
+                {
+                    // Ortam tabanlı yola geri dön
+                    var basePath = GetEnvironmentBasedPath();
+                    dataDir = Path.Combine(basePath, "PerformanceAgent");
+                }
+                
+                // Dizini oluştur ve yazma izinlerini kontrol et
+                EnsureDirectoryWithPermissions(dataDir);
                 
                 _logger.LogInformation("Using data directory: {Path}", dataDir);
                 return dataDir;
@@ -66,7 +75,17 @@ namespace WorkerService1.Services
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Failed to determine data directory, using temp path");
-                return Path.Combine(Path.GetTempPath(), "PerformanceAgent");
+                var tempDir = Path.Combine(Path.GetTempPath(), "PerformanceAgent");
+                try
+                {
+                    EnsureDirectoryWithPermissions(tempDir);
+                }
+                catch
+                {
+                    // Temp path should always be writable, but just in case
+                    Directory.CreateDirectory(tempDir);
+                }
+                return tempDir;
             }
         }
 
@@ -128,11 +147,19 @@ namespace WorkerService1.Services
 
         /// <summary>
         /// Ortam tabanlı yol al
+        /// Shared Service ve Agent erişimi için CommonApplicationData (ProgramData) kullanılır
         /// </summary>
         /// <returns>Ortam tabanlı yol</returns>
         private static string GetEnvironmentBasedPath()
         {
-            // Önce AppData kullanmaya çalış
+            // Servis ve Agent'ın aynı veritabanını okuyabilmesi için ortak alan (ProgramData) kullanılmalı
+            var commonAppData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+            if (!string.IsNullOrEmpty(commonAppData))
+            {
+                return commonAppData;
+            }
+
+            // Yedek olarak AppData
             var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
             if (!string.IsNullOrEmpty(appData))
             {
@@ -148,6 +175,132 @@ namespace WorkerService1.Services
 
             // Son çare olarak temp
             return Path.GetTempPath();
+        }
+
+        /// <summary>
+        /// Dizini oluştur ve yazma izinlerini ayarla
+        /// Windows Service ve Agent'ın aynı veritabanına yazabilmesi için gerekli
+        /// </summary>
+        /// <param name="directoryPath">Oluşturulacak dizin yolu</param>
+        private void EnsureDirectoryWithPermissions(string directoryPath)
+        {
+            try
+            {
+                // Dizin yoksa oluştur
+                if (!Directory.Exists(directoryPath))
+                {
+                    var dirInfo = Directory.CreateDirectory(directoryPath);
+                    _logger.LogInformation("Created directory: {Path}", directoryPath);
+                    
+                    // Windows'ta ACL ayarla - Everyone'a FullControl ver
+                    try
+                    {
+                        SetDirectoryPermissions(directoryPath);
+                    }
+                    catch (Exception aclEx)
+                    {
+                        _logger.LogWarning(aclEx, "Could not set ACL permissions on directory, may cause issues for Windows Service");
+                    }
+                }
+                else
+                {
+                    // Dizin var, yazılabilir mi kontrol et
+                    var testFile = Path.Combine(directoryPath, $".write_test_{Guid.NewGuid():N}");
+                    try
+                    {
+                        File.WriteAllText(testFile, "test");
+                        File.Delete(testFile);
+                    }
+                    catch (UnauthorizedAccessException)
+                    {
+                        _logger.LogWarning("Directory {Path} exists but is not writable, attempting to fix permissions", directoryPath);
+                        try
+                        {
+                            SetDirectoryPermissions(directoryPath);
+                        }
+                        catch (Exception aclEx)
+                        {
+                            _logger.LogError(aclEx, "Failed to fix directory permissions");
+                            throw;
+                        }
+                    }
+                    catch (IOException)
+                    {
+                        // IO exception during test write might indicate other issues
+                        _logger.LogDebug("IO exception during directory write test, directory may be usable");
+                    }
+                }
+                
+                // Veritabanı dosyaları varsa read-only flag'i kaldır
+                RemoveReadOnlyFromDatabaseFiles(directoryPath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error ensuring directory with permissions: {Path}", directoryPath);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Dizin için yazma izinlerini ACL ile ayarla
+        /// </summary>
+        private void SetDirectoryPermissions(string directoryPath)
+        {
+            try
+            {
+                var dirInfo = new DirectoryInfo(directoryPath);
+                var security = dirInfo.GetAccessControl();
+                
+                // En az yetki: SYSTEM + Administrators tam yetki, Users yalnızca Modify.
+                // (Everyone/FullControl verilmez; ACL devralması korunur.)
+                var inherit = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
+                foreach (var (sid, rights) in new[]
+                {
+                    (WellKnownSidType.LocalSystemSid, FileSystemRights.FullControl),
+                    (WellKnownSidType.BuiltinAdministratorsSid, FileSystemRights.FullControl),
+                    (WellKnownSidType.BuiltinUsersSid, FileSystemRights.Modify)
+                })
+                {
+                    security.AddAccessRule(new FileSystemAccessRule(
+                        new SecurityIdentifier(sid, null), rights, inherit,
+                        PropagationFlags.None, AccessControlType.Allow));
+                }
+
+                dirInfo.SetAccessControl(security);
+                _logger.LogInformation("Set ACL permissions on directory: {Path}", directoryPath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Could not set ACL permissions, running as standard user may have limitations");
+            }
+        }
+
+        /// <summary>
+        /// Veritabanı dosyalarından read-only flag'i kaldır
+        /// </summary>
+        private void RemoveReadOnlyFromDatabaseFiles(string directoryPath)
+        {
+            try
+            {
+                var dbFiles = new[] { "activities_v2.db", "activities_v2.db-wal", "activities_v2.db-shm" };
+                foreach (var dbFile in dbFiles)
+                {
+                    var filePath = Path.Combine(directoryPath, dbFile);
+                    if (File.Exists(filePath))
+                    {
+                        var fileInfo = new FileInfo(filePath);
+                        if (fileInfo.IsReadOnly)
+                        {
+                            fileInfo.IsReadOnly = false;
+                            _logger.LogInformation("Removed read-only attribute from: {Path}", filePath);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Could not remove read-only attributes from database files");
+            }
         }
     }
 

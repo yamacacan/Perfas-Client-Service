@@ -4,8 +4,6 @@ using System.IO;
 using System.Linq;
 using System.Management;
 using System.Net;
-using System.Runtime.InteropServices;
-using System.Security.Principal;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -23,43 +21,6 @@ namespace WorkerService1.Services
         // Servis bağımlılıkları
         private readonly ILogger<SystemInfoService> _logger;
         private readonly string _systemDir; // Sistem bilgilerinin kaydedileceği dizin
-
-        // Donanım placeholder'ları - geçersiz donanım bilgilerini filtrelemek için
-        private static readonly HashSet<string> HardwarePlaceholders = new(StringComparer.OrdinalIgnoreCase)
-        {
-            string.Empty,
-            "unknown",
-            "not available",
-            "n/a",
-            "na",
-            "not applicable",
-            "to be filled by o.e.m.",
-            "system manufacturer",
-            "system product name",
-            "default string",
-            "default",
-            "desktop",
-            "laptop",
-            "computer",
-            "pc",
-            "workstation"
-        };
-
-        // Seri numarası placeholder'ları - geçersiz seri numaralarını filtrelemek için
-        private static readonly HashSet<string> SerialPlaceholders = new(StringComparer.OrdinalIgnoreCase)
-        {
-            string.Empty,
-            "unknown",
-            "not available",
-            "n/a",
-            "na",
-            "not applicable",
-            "to be filled by o.e.m.",
-            "serial number",
-            "serialnumber",
-            "default string",
-            "default"
-        };
 
         /// <summary>
         /// Constructor - servis bağımlılıklarını alır
@@ -152,18 +113,71 @@ namespace WorkerService1.Services
         /// <returns>OS sürüm bilgisi</returns>
         private string BuildOperatingSystemVersion()
         {
-            // Registry'den OS bilgisini almaya çalış (64-bit ve 32-bit)
+            // Yöntem 1: WMI'dan OS bilgisini al (en güvenilir kaynak)
+            var wmiLabel = TryBuildOsLabelFromWmi();
+            if (!string.IsNullOrWhiteSpace(wmiLabel))
+            {
+                _logger.LogDebug("OS version retrieved from WMI: {Label}", wmiLabel);
+                return wmiLabel!;
+            }
+
+            // Yöntem 2: Registry'den OS bilgisini almaya çalış (yedek)
             foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
             {
                 var label = TryBuildOsLabelFromRegistry(view);
                 if (!string.IsNullOrWhiteSpace(label))
                 {
+                    _logger.LogDebug("OS version retrieved from Registry ({View}): {Label}", view, label);
                     return label!;
                 }
             }
 
-            // Registry'den alınamazsa Environment'tan al
-            return Environment.OSVersion.VersionString;
+            // Yöntem 3: Environment'tan al (son çare)
+            var envVersion = Environment.OSVersion.VersionString;
+            _logger.LogDebug("OS version retrieved from Environment (fallback): {Label}", envVersion);
+            return envVersion;
+        }
+
+        /// <summary>
+        /// WMI'dan OS bilgisini almaya çalış
+        /// </summary>
+        private string? TryBuildOsLabelFromWmi()
+        {
+            try
+            {
+                using var searcher = new ManagementObjectSearcher("root\\CIMV2",
+                    "SELECT Caption, Version, BuildNumber FROM Win32_OperatingSystem");
+                using var results = searcher.Get();
+
+                foreach (ManagementObject obj in results)
+                {
+                    var caption = NormalizeValue(obj["Caption"]);     // "Microsoft Windows 11 Pro"
+                    var version = NormalizeValue(obj["Version"]);     // "10.0.22631"
+                    var buildNumber = NormalizeValue(obj["BuildNumber"]); // "22631"
+
+                    if (!string.IsNullOrWhiteSpace(caption))
+                    {
+                        // Caption zaten tam ismi içeriyor, build numarasını da ekleyelim
+                        if (!string.IsNullOrWhiteSpace(buildNumber) && !caption.Contains(buildNumber))
+                        {
+                            return $"{caption} (build {buildNumber})";
+                        }
+                        return caption;
+                    }
+
+                    // Caption yoksa version kullan
+                    if (!string.IsNullOrWhiteSpace(version))
+                    {
+                        return $"Windows {version}";
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "WMI query for OS version failed");
+            }
+
+            return null;
         }
 
         private string? TryBuildOsLabelFromRegistry(RegistryView view)
@@ -176,6 +190,7 @@ namespace WorkerService1.Services
                 using var key = baseKey.OpenSubKey(keyPath);
                 if (key is null)
                 {
+                    _logger.LogDebug("Registry key not found for view {View}", view);
                     return null;
                 }
 
@@ -184,6 +199,21 @@ namespace WorkerService1.Services
                 var releaseId = GetRegistryValueAsString(key, "ReleaseId");
                 var currentBuild = GetRegistryValueAsString(key, "CurrentBuild");
                 var ubr = GetRegistryValueAsString(key, "UBR");
+
+                _logger.LogDebug("Registry values - ProductName: {ProductName}, DisplayVersion: {DisplayVersion}, CurrentBuild: {CurrentBuild}, UBR: {UBR}",
+                    productName, displayVersion, currentBuild, ubr);
+
+                // Windows 11 düzeltmesi: Build 22000 ve üzeri Windows 11'dir
+                // Registry'de hâlâ "Windows 10" yazabilir, bunu düzeltiyoruz
+                if (!string.IsNullOrWhiteSpace(productName) &&
+                    !string.IsNullOrWhiteSpace(currentBuild) &&
+                    int.TryParse(currentBuild, out var buildNumber) &&
+                    buildNumber >= 22000 &&
+                    productName.Contains("Windows 10", StringComparison.OrdinalIgnoreCase))
+                {
+                    productName = productName.Replace("Windows 10", "Windows 11", StringComparison.OrdinalIgnoreCase);
+                    _logger.LogDebug("Corrected Windows 11 ProductName based on build number {Build}: {ProductName}", buildNumber, productName);
+                }
 
                 var buildSegment = string.IsNullOrWhiteSpace(currentBuild)
                     ? string.Empty
@@ -203,6 +233,7 @@ namespace WorkerService1.Services
 
                 if (parts.Count == 0 && string.IsNullOrWhiteSpace(buildSegment))
                 {
+                    _logger.LogDebug("No valid OS info found in Registry for view {View}", view);
                     return null;
                 }
 
@@ -270,51 +301,11 @@ namespace WorkerService1.Services
                 serialCandidates.Add(NormalizeValue(obj["SerialNumber"]));
             });
 
-            var manufacturer = SelectHardwareCandidate(manufacturerCandidates, machineName);
-            var model = SelectHardwareCandidate(modelCandidates, machineName);
-            var serial = SelectSerialCandidate(serialCandidates, machineName);
+            var manufacturer = HardwareValueSanitizer.SelectHardwareCandidate(manufacturerCandidates, machineName);
+            var model = HardwareValueSanitizer.SelectHardwareCandidate(modelCandidates, machineName);
+            var serial = HardwareValueSanitizer.SelectSerialCandidate(serialCandidates, machineName);
 
             return (manufacturer, model, serial);
-        }
-
-        private string? SelectHardwareCandidate(IEnumerable<string?> candidates, string machineName)
-        {
-            foreach (var candidate in candidates)
-            {
-                var cleaned = CleanHardwareValue(candidate, machineName);
-                if (!string.IsNullOrWhiteSpace(cleaned))
-                {
-                    return cleaned;
-                }
-            }
-
-            return null;
-        }
-
-        private string? SelectSerialCandidate(IEnumerable<string?> candidates, string machineName)
-        {
-            foreach (var candidate in candidates)
-            {
-                var cleaned = CleanSerialValue(candidate, machineName);
-                if (!string.IsNullOrWhiteSpace(cleaned))
-                {
-                    return cleaned;
-                }
-            }
-
-            return null;
-        }
-
-        private static string MapArchitecture()
-        {
-            return RuntimeInformation.OSArchitecture switch
-            {
-                Architecture.X64 => "x64",
-                Architecture.X86 => "x86",
-                Architecture.Arm64 => "arm64",
-                Architecture.Arm => "arm",
-                _ => RuntimeInformation.OSArchitecture.ToString().ToLowerInvariant()
-            };
         }
 
         private static string GetRegistryValueAsString(RegistryKey key, string valueName)
@@ -343,241 +334,6 @@ namespace WorkerService1.Services
             return string.IsNullOrWhiteSpace(str) ? null : str.Trim();
         }
 
-        private static string? CleanHardwareValue(string? value, string machineName)
-        {
-            if (string.IsNullOrWhiteSpace(value))
-            {
-                return null;
-            }
-
-            var normalized = value.Trim();
-            if (HardwarePlaceholders.Contains(normalized))
-            {
-                return null;
-            }
-
-            // Check against machine name - only filter if it's exactly the same
-            if (string.Equals(normalized, machineName, StringComparison.OrdinalIgnoreCase))
-            {
-                return null;
-            }
-
-            // Don't filter partial matches with machine name for hardware info
-            // as legitimate hardware names might contain similar patterns
-
-            var user = Environment.UserName;
-            if (!string.IsNullOrWhiteSpace(user))
-            {
-                // Exact match with username
-                if (string.Equals(normalized, user, StringComparison.OrdinalIgnoreCase))
-                {
-                    return null;
-                }
-                
-                // Partial match with username - be more conservative
-                if (normalized.Length > 3 && normalized.Contains(user, StringComparison.OrdinalIgnoreCase))
-                {
-                    return null;
-                }
-            }
-
-            var domain = Environment.UserDomainName;
-            if (!string.IsNullOrWhiteSpace(domain))
-            {
-                if (string.Equals(normalized, domain, StringComparison.OrdinalIgnoreCase))
-                {
-                    return null;
-                }
-                
-                if (normalized.Length > 3 && normalized.Contains(domain, StringComparison.OrdinalIgnoreCase))
-                {
-                    return null;
-                }
-                
-                var domainUser = $"{domain}\\{user}";
-                if (string.Equals(normalized, domainUser, StringComparison.OrdinalIgnoreCase))
-                {
-                    return null;
-                }
-            }
-
-            // Check for common generic patterns
-            if (IsGenericHardwareName(normalized))
-            {
-                return null;
-            }
-
-            return normalized;
-        }
-
-        private static string? CleanSerialValue(string? value, string machineName)
-        {
-            if (string.IsNullOrWhiteSpace(value))
-            {
-                return null;
-            }
-
-            var normalized = value.Trim();
-            if (SerialPlaceholders.Contains(normalized))
-            {
-                return null;
-            }
-
-            // Check against machine name - only filter if it's exactly the same
-            if (string.Equals(normalized, machineName, StringComparison.OrdinalIgnoreCase))
-            {
-                return null;
-            }
-
-            // Don't filter partial matches with machine name for serial numbers
-            // as legitimate serial numbers might contain similar patterns
-
-            var user = Environment.UserName;
-            if (!string.IsNullOrWhiteSpace(user))
-            {
-                // Exact match with username
-                if (string.Equals(normalized, user, StringComparison.OrdinalIgnoreCase))
-                {
-                    return null;
-                }
-                
-                // Partial match with username - be more conservative
-                if (normalized.Length > 3 && normalized.Contains(user, StringComparison.OrdinalIgnoreCase))
-                {
-                    return null;
-                }
-            }
-
-            var domain = Environment.UserDomainName;
-            if (!string.IsNullOrWhiteSpace(domain))
-            {
-                if (string.Equals(normalized, domain, StringComparison.OrdinalIgnoreCase))
-                {
-                    return null;
-                }
-                
-                if (normalized.Length > 3 && normalized.Contains(domain, StringComparison.OrdinalIgnoreCase))
-                {
-                    return null;
-                }
-                
-                var domainUser = $"{domain}\\{user}";
-                if (string.Equals(normalized, domainUser, StringComparison.OrdinalIgnoreCase))
-                {
-                    return null;
-                }
-            }
-
-            // Check for empty GUID
-            if (Guid.TryParse(normalized, out var parsedGuid) && parsedGuid == Guid.Empty)
-            {
-                return null;
-            }
-
-            // Check for uniform characters
-            if (IsUniformCharacter(normalized, '0') || IsUniformCharacter(normalized, 'F') || IsUniformCharacter(normalized, 'X'))
-            {
-                return null;
-            }
-
-            // Check for generic serial patterns
-            if (IsGenericSerialNumber(normalized))
-            {
-                return null;
-            }
-
-            return normalized;
-        }
-
-        private static bool IsGenericSerialNumber(string value)
-        {
-            if (string.IsNullOrEmpty(value))
-            {
-                return false;
-            }
-
-            var lowerValue = value.ToLowerInvariant();
-            
-            // Check for common generic serial patterns
-            var genericPatterns = new[]
-            {
-                "serial", "number", "sn", "s/n", "serialnumber", "serial_number"
-            };
-
-            foreach (var pattern in genericPatterns)
-            {
-                if (lowerValue.Contains(pattern))
-                {
-                    return true;
-                }
-            }
-
-            // Check if it's too short (likely not a real serial)
-            if (value.Length < 3)
-            {
-                return true;
-            }
-
-            // Check if it's mostly the same character
-            if (value.All(c => c == value[0]))
-            {
-                return true;
-            }
-
-            return false;
-        }
-
-        private static bool IsGenericHardwareName(string value)
-        {
-            if (string.IsNullOrEmpty(value))
-            {
-                return false;
-            }
-
-            var lowerValue = value.ToLowerInvariant();
-            
-            // Check for common generic patterns - be more specific
-            var genericPatterns = new[]
-            {
-                "pc", "desktop", "laptop", "computer", "workstation", "machine",
-                "system", "device", "unit", "box", "tower", "case", "unknown",
-                "not available", "n/a", "na", "not applicable", "default"
-            };
-
-            // Only consider it generic if it's exactly one of these patterns
-            // or if it's very short and contains only generic terms
-            if (genericPatterns.Contains(lowerValue))
-            {
-                return true;
-            }
-
-            // Check if it's mostly numbers or generic characters AND very short
-            if (value.Length < 5 && lowerValue.All(c => char.IsDigit(c) || c == '-' || c == '_' || c == '.'))
-            {
-                return true;
-            }
-
-            return false;
-        }
-
-        private static bool IsUniformCharacter(string value, char character)
-        {
-            if (string.IsNullOrEmpty(value))
-            {
-                return false;
-            }
-
-            foreach (var ch in value)
-            {
-                if (char.ToUpperInvariant(ch) != char.ToUpperInvariant(character))
-                {
-                    return false;
-                }
-            }
-
-            return true;
-        }
-
         /// <summary>
         /// Disk bilgilerini topla (tüm diskler toplam)
         /// </summary>
@@ -591,7 +347,7 @@ namespace WorkerService1.Services
 
                 // Tüm sabit diskleri topla
                 var drives = DriveInfo.GetDrives().Where(d => d.IsReady && d.DriveType == DriveType.Fixed);
-                
+
                 foreach (var drive in drives)
                 {
                     totalBytes += drive.TotalSize;
@@ -626,13 +382,13 @@ namespace WorkerService1.Services
                 // WMI ile RAM bilgilerini al
                 using var searcher = new ManagementObjectSearcher("root\\CIMV2", "SELECT TotalVisibleMemorySize, FreePhysicalMemory FROM Win32_OperatingSystem");
                 using var results = searcher.Get();
-                
+
                 foreach (ManagementObject obj in results)
                 {
                     // WMI değerleri KB cinsinden geliyor
                     var totalKB = Convert.ToDouble(obj["TotalVisibleMemorySize"]);
                     var freeKB = Convert.ToDouble(obj["FreePhysicalMemory"]);
-                    
+
                     totalBytes = totalKB * 1024;
                     freeBytes = freeKB * 1024;
                     break; // İlk sonuç yeterli
@@ -661,11 +417,11 @@ namespace WorkerService1.Services
             {
                 using var searcher = new ManagementObjectSearcher("root\\CIMV2", "SELECT UUID FROM Win32_ComputerSystemProduct");
                 using var results = searcher.Get();
-                
+
                 foreach (ManagementObject obj in results)
                 {
                     var uuid = NormalizeValue(obj["UUID"]);
-                    if (!string.IsNullOrWhiteSpace(uuid) && 
+                    if (!string.IsNullOrWhiteSpace(uuid) &&
                         !uuid.Equals("FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF", StringComparison.OrdinalIgnoreCase) &&
                         !uuid.Equals("00000000-0000-0000-0000-000000000000", StringComparison.OrdinalIgnoreCase))
                     {

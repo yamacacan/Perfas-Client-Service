@@ -4,7 +4,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
-using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 
 namespace WorkerService1.Services
@@ -16,19 +15,16 @@ namespace WorkerService1.Services
     public class HealthCheckService
     {
         private readonly ILogger<HealthCheckService> _logger;
-        private readonly ActivityDatabaseService _databaseService;
         private readonly BrowserHistoryService _browserHistoryService;
         private readonly string _dataDirectory;
         private readonly DateTime _startTime = DateTime.UtcNow;
 
         public HealthCheckService(
             ILogger<HealthCheckService> logger,
-            ActivityDatabaseService databaseService,
             BrowserHistoryService browserHistoryService,
             string dataDirectory)
         {
             _logger = logger;
-            _databaseService = databaseService;
             _browserHistoryService = browserHistoryService;
             _dataDirectory = dataDirectory;
         }
@@ -50,8 +46,8 @@ namespace WorkerService1.Services
                     SystemInfo = GetSystemInfo()
                 };
 
-                // Database health check
-                status.Database = await CheckDatabaseHealthAsync();
+                // Storage health check (replaces Database)
+                status.Storage = await CheckStorageHealthAsync();
 
                 // File system health check
                 status.FileSystem = CheckFileSystemHealth();
@@ -63,7 +59,7 @@ namespace WorkerService1.Services
                 status.BrowserWatchers = CheckBrowserWatchersHealth();
 
                 // Overall health determination
-                status.IsHealthy = status.Database.IsHealthy && 
+                status.IsHealthy = status.Storage.IsHealthy && 
                                  status.FileSystem.IsHealthy && 
                                  status.Memory.IsHealthy && 
                                  status.BrowserWatchers.IsHealthy;
@@ -83,44 +79,57 @@ namespace WorkerService1.Services
         }
 
         /// <summary>
-        /// Database sağlık durumunu kontrol et
+        /// Storage sağlık durumunu kontrol et (JSONL)
         /// </summary>
-        private async Task<ComponentHealth> CheckDatabaseHealthAsync()
+        private async Task<ComponentHealth> CheckStorageHealthAsync()
         {
+            await Task.Yield(); // Async uyumluluğu için
             try
             {
-                var dbPath = Path.Combine(_dataDirectory, "activities.db");
-                if (!File.Exists(dbPath))
+                var storagePath = Path.Combine(_dataDirectory, "data");
+                if (!Directory.Exists(storagePath))
                 {
                     return new ComponentHealth
                     {
                         IsHealthy = false,
-                        Message = "Database file not found",
+                        Message = "Storage directory not found",
                         LastChecked = DateTime.UtcNow
                     };
                 }
 
-                // Test database connection
-                using var connection = new SqliteConnection($"Data Source={dbPath};Cache=Shared");
-                await connection.OpenAsync();
+                // Check writability by creating and deleting a dummy file
+                var testFile = Path.Combine(storagePath, $"health_check_{Guid.NewGuid()}.tmp");
+                try
+                {
+                    await File.WriteAllTextAsync(testFile, "test");
+                    File.Delete(testFile);
+                }
+                catch (Exception ex)
+                {
+                    return new ComponentHealth
+                    {
+                        IsHealthy = false,
+                        Message = $"Storage not writable: {ex.Message}",
+                        LastChecked = DateTime.UtcNow,
+                        Error = ex.Message
+                    };
+                }
 
-                // Test query
-                using var command = new SqliteCommand("SELECT COUNT(*) FROM ActivityLogs", connection);
-                var count = await command.ExecuteScalarAsync();
-
-                // Check database size
-                var fileInfo = new FileInfo(dbPath);
-                var sizeInMB = fileInfo.Length / (1024.0 * 1024.0);
+                var dirs = Directory.GetDirectories(storagePath);
+                var files = Directory.GetFiles(storagePath, "*.*", SearchOption.AllDirectories);
+                var sizeBytes = files.Sum(f => new FileInfo(f).Length);
+                var sizeMB = sizeBytes / (1024.0 * 1024.0);
 
                 return new ComponentHealth
                 {
                     IsHealthy = true,
-                    Message = $"Database healthy - {count} records, {sizeInMB:F2} MB",
+                    Message = $"Storage healthy - {files.Length} files, {sizeMB:F2} MB",
                     LastChecked = DateTime.UtcNow,
                     Metrics = new Dictionary<string, object>
                     {
-                        ["record_count"] = count ?? 0,
-                        ["size_mb"] = sizeInMB
+                        ["file_count"] = files.Length,
+                        ["size_mb"] = sizeMB,
+                        ["sub_directories"] = dirs.Length
                     }
                 };
             }
@@ -129,7 +138,7 @@ namespace WorkerService1.Services
                 return new ComponentHealth
                 {
                     IsHealthy = false,
-                    Message = $"Database error: {ex.Message}",
+                    Message = $"Storage error: {ex.Message}",
                     LastChecked = DateTime.UtcNow,
                     Error = ex.Message
                 };
@@ -359,7 +368,7 @@ namespace WorkerService1.Services
         public TimeSpan Uptime { get; set; }
         public string Version { get; set; } = string.Empty;
         public SystemInfo SystemInfo { get; set; } = new();
-        public ComponentHealth Database { get; set; } = new();
+        public ComponentHealth Storage { get; set; } = new(); // Replaced Database with Storage
         public ComponentHealth FileSystem { get; set; } = new();
         public ComponentHealth Memory { get; set; } = new();
         public ComponentHealth BrowserWatchers { get; set; } = new();

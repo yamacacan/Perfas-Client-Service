@@ -277,3 +277,11 @@ Sorunlar için:
 dotnet run
 ```
 
+
+---
+
+## Gizli Bilgiler (ApiUrl / ApiToken / AesKey)
+
+Bu değerler repoda tutulmaz. Okunma sırası: HKLM\SOFTWARE\Perfas\PerformanceAgent (MSI yazar) → ortam değişkenleri `PERFAS_APIURL`, `PERFAS_APITOKEN`, `PERFAS_AESKEY` → appsettings.json. ApiUrl HTTPS olmalı, AesKey UTF-8 olarak tam 32 bayt olmalıdır; aksi halde senkronizasyon devre dışı kalır.
+
+Testler: `dotnet test Tests`

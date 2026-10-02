@@ -12,21 +12,21 @@ namespace WorkerService1.Services
 {
     /// <summary>
     /// Aktivite takip servisi - pencere izleme için
-    /// Kullanıcının aktif pencere değişikliklerini takip eder ve oturum bilgilerini kaydeder
+    /// Kullanıcının aktif pencere değişikliklerini takip eder ve JSONL dosyasına kaydeder
     /// </summary>
     public class ActivityTrackingService
     {
         // Servis bağımlılıkları
         private readonly ILogger<ActivityTrackingService> _logger;
-        private readonly string _activitiesDir; // Aktivite loglarının dizini
-        private readonly bool _enableConsoleOutput; // Konsol çıktısı aktif mi?
-        private readonly ActivityDatabaseService _databaseService; // SQLite veritabanı servisi
+        private readonly string _activitiesDir;
+        private readonly bool _enableConsoleOutput;
+        private readonly IActivityStore _storageService;
 
         // Aktivite durumu
-        private int _currentPid = -1; // Mevcut process ID
-        private string _currentProcess = ""; // Mevcut process adı
-        private string _currentTitle = ""; // Mevcut pencere başlığı
-        private DateTimeOffset _sessionStart = DateTimeOffset.MinValue; // Oturum başlangıç zamanı
+        private int _currentPid = -1;
+        private string _currentProcess = "";
+        private string _currentTitle = "";
+        private DateTimeOffset _sessionStart = DateTimeOffset.MinValue;
 
         // Browser tracking
         private static readonly HashSet<string> BrowserProcessNames = new(StringComparer.OrdinalIgnoreCase)
@@ -40,12 +40,12 @@ namespace WorkerService1.Services
         public ActivityTrackingService(
             ILogger<ActivityTrackingService> logger, 
             string activitiesDir,
-            ActivityDatabaseService databaseService,
+            IActivityStore storageService,
             bool enableConsoleOutput = true)
         {
             _logger = logger;
             _activitiesDir = activitiesDir;
-            _databaseService = databaseService;
+            _storageService = storageService;
             _enableConsoleOutput = enableConsoleOutput;
         }
 
@@ -80,7 +80,7 @@ namespace WorkerService1.Services
                     _currentTitle = title ?? "";
                     _sessionStart = DateTimeOffset.Now;
                 }
-                // Aynı pencere - hiçbir şey yapma (sürekli kayıt yok)
+                // Aynı pencere - hiçbir şey yapma
             }
             catch (Exception ex)
             {
@@ -110,7 +110,7 @@ namespace WorkerService1.Services
         }
 
         /// <summary>
-        /// Log activity to database - Window activity kaydeder
+        /// Log activity to JSONL storage
         /// </summary>
         private async Task LogActivityAsync(DateTimeOffset endTime, string username, string domain, CancellationToken ct)
         {
@@ -123,15 +123,14 @@ namespace WorkerService1.Services
                 var userSid = GetCurrentUserSid();
                 var motherboardUuid = GetMotherboardUuid();
                 
-                // Debug: Log values
                 _logger.LogDebug("Creating ActivityLog - UserSid: '{UserSid}', MotherboardUuid: '{Uuid}'", 
                     userSid, motherboardUuid);
 
-                // SQLite veritabanına kaydet
+                // JSONL storage'a kaydet
                 var activity = new ActivityLog
                 {
-                    Evt = "activity", // Event tipi
-                    ActivityType = "window", // Window activity
+                    Evt = "activity",
+                    ActivityType = "window",
                     ProcessName = process,
                     Title = title,
                     StartTimeUtc = _sessionStart.UtcDateTime,
@@ -140,13 +139,11 @@ namespace WorkerService1.Services
                     Username = username,
                     Domain = domain,
                     UserSid = userSid,
-                    MotherboardUuid = motherboardUuid
+                    MotherboardUuid = motherboardUuid,
+                    CreatedAtUtc = DateTime.UtcNow
                 };
 
-                await _databaseService.InsertActivityAsync(activity);
-
-                // JSON dosyasına da yaz (backup için)
-                await WriteToActivityLogAsync(activity, ct);
+                await _storageService.SaveActivityAsync(activity);
                 
                 _logger.LogInformation("📝 Window activity kaydedildi: {Process} - {Title} ({Duration}ms)", 
                     process, title, durationMs);
@@ -154,37 +151,6 @@ namespace WorkerService1.Services
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Failed to log activity");
-                throw;
-            }
-        }
-
-
-        /// <summary>
-        /// Write activity to log file (backup)
-        /// </summary>
-        private async Task WriteToActivityLogAsync(ActivityLog activity, CancellationToken ct)
-        {
-            try
-            {
-                // Optimizasyon: StringBuilder kullan (JsonSerializer'dan daha hızlı)
-                var sb = new StringBuilder(384); // Pre-allocate
-                sb.Append("{\"evt\":\"activity\",");
-                sb.Append("\"activity_type\":\"").Append(activity.ActivityType).Append("\",");
-                sb.Append("\"start\":\"").Append(activity.StartTimeUtc.ToString("O")).Append("\",");
-                sb.Append("\"end\":\"").Append(activity.EndTimeUtc.ToString("O")).Append("\",");
-                sb.Append("\"duration_ms\":").Append(activity.DurationMs).Append(",");
-                sb.Append("\"process\":\"").Append(JsonEncodedText.Encode(activity.ProcessName).Value).Append("\",");
-                sb.Append("\"title\":").Append(activity.Title != null ? $"\"{JsonEncodedText.Encode(activity.Title).Value}\"" : "null").Append(",");
-                sb.Append("\"username\":\"").Append(activity.Username).Append("\",");
-                sb.Append("\"domain\":\"").Append(activity.Domain).Append("\"");
-                sb.Append("}\n");
-
-                var dailyFile = Path.Combine(_activitiesDir, $"{DateTimeOffset.Now:yyyy-MM-dd}.jsonl");
-                await File.AppendAllTextAsync(dailyFile, sb.ToString(), ct);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to write activity log");
                 throw;
             }
         }
